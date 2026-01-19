@@ -87,3 +87,10 @@ python 03_Inference.py
 *   `FunASR_Nano_Decoder_Embed.onnx` : 文本 Embedder
 *   `qwen3-0.6b-asr.gguf` : LLM 主模型
 *   `Qwen3-0.6B/` : 分词器文件 (Tokenizer)
+
+
+## 速度说明
+
+fp16 的 LLM Decoder 用 llama.cpp 在 CPU 上跑，速度可以达到 38tokens/s
+
+如果启用了 vulkan 编译 llama-cpp-python，会发现无法运行，当下我还没有找到在 GPU 上运行的方法，需要显示用 `$env:VK_ICD_FILENAMES="none"`  环境变量禁止 GPU。
