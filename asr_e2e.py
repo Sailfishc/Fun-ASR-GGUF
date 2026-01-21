@@ -39,32 +39,26 @@ import gguf
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 模型路径
-MODEL_DIR = os.path.join(SCRIPT_DIR, "model-gguf")
-ENCODER_ONNX_PATH = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Encoder.int8.onnx")  
-DECODER_GGUF_PATH = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Decoder.q8_0.gguf")
+MODEL_DIR           = os.path.join(SCRIPT_DIR, "model-gguf")
+ENCODER_ONNX_PATH   = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Encoder.int8.onnx")  
+CTC_ONNX_PATH       = os.path.join(MODEL_DIR, "Fun-ASR-Nano-CTC.int8.onnx")
+DECODER_GGUF_PATH   = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Decoder.q8_0.gguf")
+TOKENS_PATH         = os.path.join(MODEL_DIR, "tokens.txt")
 
 # llama.cpp 编译版本的 DLL 所在目录
 # 下载地址：https://github.com/ggml-org/llama.cpp/releases/download/b7786/llama-b7786-bin-win-vulkan-x64.zip
-BIN_DIR = os.path.join(SCRIPT_DIR, "bin")
-GGML_DLL_PATH = os.path.join(BIN_DIR, "ggml.dll")
+BIN_DIR             = os.path.join(SCRIPT_DIR, "bin")
+GGML_DLL_PATH       = os.path.join(BIN_DIR, "ggml.dll")
 LLAMA_DLL_PATH = os.path.join(BIN_DIR, "llama.dll")
 GGML_BASE_DLL_PATH = os.path.join(BIN_DIR, "ggml-base.dll")
 
 # 输入音频
-INPUT_AUDIO = os.path.join(SCRIPT_DIR, "input.mp3")
-
+INPUT_AUDIO = os.path.join(SCRIPT_DIR, "input2.mp3")
 
 # ASR Prompts
-hotwords = '睡前消息, Claude Code'
-PREFIX_PROMPT = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-# PREFIX_PROMPT += f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
-# PREFIX_PROMPT += f"热词列表：[{hotwords}]\n"
-PREFIX_PROMPT += "\n语音转写：\n"
-SUFFIX_PROMPT = "\n<|im_end|>\n<|im_start|>assistant"
+# 默认热词表（在本例中用于简单匹配）
+DEFAULT_HOTWORDS = ['Claude Code', 'Antigravity', 'SenseVoice', 'FunASR']
 STOP_TOKENS = [151643, 151645]
-
-
-
 
 # 音频参数
 SAMPLE_RATE = 16000
@@ -303,8 +297,64 @@ llama_token_to_piece.argtypes = [ctypes.c_void_p, llama_token, ctypes.c_char_p, 
 llama_token_to_piece.restype = ctypes.c_int
 
 # =========================================================================
-# Helper Functions
+# CTC & Hotword Functions
 # =========================================================================
+
+import base64
+
+def load_ctc_tokens(filename):
+    """加载 CTC 词表"""
+    id2token = dict()
+    if not os.path.exists(filename):
+        return id2token
+    with open(filename, encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if not parts: continue
+            if len(parts) == 1:
+                t, i = " ", parts[0]
+            else:
+                t, i = parts
+            id2token[int(i)] = t
+    return id2token
+
+def decode_ctc(logits, id2token):
+    """解码 CTC Logits 并计算时间戳"""
+    indices = np.argmax(logits[0], axis=-1)
+    blank_id = max(id2token.keys()) if id2token else 0
+    
+    frame_shift_ms = 60
+    offset_ms = -30
+    
+    results = []
+    last_idx = -1
+    for i, idx in enumerate(indices):
+        if idx == blank_id or idx == last_idx:
+            last_idx = idx
+            continue
+        last_idx = idx
+        token_b64 = id2token.get(idx, "")
+        if not token_b64: continue
+        
+        try:
+            token_text = base64.b64decode(token_b64).decode("utf-8")
+        except:
+            continue
+            
+        timestamp = max((i * frame_shift_ms + offset_ms) / 1000.0, 0.0)
+        results.append({"text": token_text, "start": timestamp})
+                
+    full_text = "".join([r["text"] for r in results])
+    return full_text, results
+
+def match_hotwords(text, hotword_list):
+    """简单的热词匹配逻辑"""
+    matched = []
+    target_text = text.lower()
+    for hw in hotword_list:
+        if hw.lower() in target_text:
+            matched.append(hw)
+    return matched
 
 # =========================================================================
 # Helper Functions
@@ -439,46 +489,62 @@ def load_audio(audio_path):
     
     return audio
 
-def encode_audio(audio, ort_session, query_embed):
-    """使用 ONNX Encoder 将音频转换为 embedding"""
+def encode_audio(audio, encoder_sess):
+    """使用 ONNX Encoder 获取 LLM 嵌入和 CTC 特征"""
     import onnxruntime
     
     # Reshape: (1, 1, audio_len)
     audio_input = audio.reshape(1, 1, -1)
+    query_embed = np.ones((1, 10, 1024), dtype=np.float32)
     
-    in_names = [x.name for x in ort_session.get_inputs()]
-    out_names = [x.name for x in ort_session.get_outputs()]
+    in_names = [x.name for x in encoder_sess.get_inputs()]
+    out_names = [x.name for x in encoder_sess.get_outputs()]
     
+    # 输入: audio, query_embed
+    # 输出: concat_embed, ids_len, enc_output
     input_feed = {
         in_names[0]: onnxruntime.OrtValue.ortvalue_from_numpy(audio_input, 'cpu', 0),
         in_names[1]: onnxruntime.OrtValue.ortvalue_from_numpy(query_embed, 'cpu', 0),
     }
     
-    outputs = ort_session.run_with_ort_values(out_names, input_feed)
-    audio_features = outputs[0].numpy()
-    return audio_features.squeeze(0)
+    outputs = encoder_sess.run_with_ort_values(out_names, input_feed)
+    
+    audio_embd = outputs[0].numpy().squeeze(0) # [N, 1024]
+    enc_output = outputs[2].numpy()           # [1, T, 512]
+    
+    return audio_embd, enc_output
 
 # =========================================================================
 # 高级封装函数 (High Level Functions)
 # =========================================================================
 
-def load_onnx_model():
-    """步骤 1: 加载 ONNX 音频编码器"""
-    print("\n[1] 加载 ONNX Audio Encoder...")
+def load_onnx_models():
+    """步骤 1: 加载 ONNX 音频编码器和 CTC Head"""
+    print("\n[1] 加载 ONNX Models (Encoder + CTC)...")
     import onnxruntime
     
     t_start = time.perf_counter()
     session_opts = onnxruntime.SessionOptions()
     session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     
-    ort_session = onnxruntime.InferenceSession(
+    encoder_sess = onnxruntime.InferenceSession(
         ENCODER_ONNX_PATH, 
         sess_options=session_opts, 
         providers=['CPUExecutionProvider']
     )
+    
+    ctc_sess = onnxruntime.InferenceSession(
+        CTC_ONNX_PATH, 
+        sess_options=session_opts, 
+        providers=['CPUExecutionProvider']
+    )
+    
     t_cost = time.perf_counter() - t_start
     print(f"    Encoder: {os.path.basename(ENCODER_ONNX_PATH)}")
-    return ort_session, t_cost
+    print(f"    CTC Head: {os.path.basename(CTC_ONNX_PATH)}")
+    print(f"    ONNX Models Loaded in {t_cost:.2f}s")
+    
+    return encoder_sess, ctc_sess, t_cost
 
 def load_gguf_model():
     """步骤 2: 加载 GGUF LLM 解码器"""
@@ -515,13 +581,55 @@ def load_embedding_weights():
     print(f"    Embedding table: {embedding_table.shape} (耗时: {t_read*1000:.2f}ms)")
     return embedding_table, t_read
 
-def prepare_prompt_embeddings(vocab, embedding_table):
-    """步骤 4: 生成提示词 Embedding"""
-    print("\n[4] 生成 prefix/suffix embeddings...")
+def process_audio_file(audio_path, encoder_sess):
+    """步骤 4: 加载并编码音频"""
+    print(f"\n[4] 加载音频和 Encode: {os.path.basename(audio_path)}")
+    
+    audio = load_audio(audio_path)
+    audio_len = len(audio)
+    print(f"    音频长度: {audio_len} samples ({audio_len/SAMPLE_RATE:.2f}s)")
+    
+    t_start = time.perf_counter()
+    audio_embd, enc_output = encode_audio(audio, encoder_sess)
+    t_cost = time.perf_counter() - t_start
+    
+    print(f"    耗时: {t_cost*1000:.2f}ms")
+    return audio_embd, enc_output, audio_len, t_cost
 
-    # 如果 embedding_table 是 None (比如加载失败)，直接返回 None
-    if embedding_table is None:
-        return None, None, 0, 0
+def run_ctc_pass(ctc_sess, enc_output, ctc_id2token, hotword_list):
+    """步骤 5: CTC Decode & Hotword Matching"""
+    print("\n[5] CTC Decode")
+    t_start = time.perf_counter()
+    
+    ctc_logits = ctc_sess.run(None, {"enc_output": enc_output})[0]
+    ctc_text, ctc_results = decode_ctc(ctc_logits, ctc_id2token)
+    
+    t_cost = time.perf_counter() - t_start
+    
+    print(f"    CTC 识别结果：{ctc_text}")
+    
+    # 格式化时间戳输出
+    ts_list = [float(f"{r['start']:.2f}") for r in ctc_results]
+    print(f"    CTC 时间戳：{ts_list[:10]} ......")
+    
+    matched_hws = match_hotwords(ctc_text, hotword_list)
+    print(f"    热词：{matched_hws}")
+    
+    return matched_hws, t_cost
+
+def prepare_prompt_embeddings(vocab, embedding_table, matched_hotwords=None):
+    """步骤 6: 生成 Prompt"""
+    print("\n[6] 生成 Prompt")
+    
+    PREFIX_PROMPT = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+    SUFFIX_PROMPT = "\n<|im_end|>\n<|im_start|>assistant"
+
+    if matched_hotwords:
+        hotwords = ", ".join(matched_hotwords)
+        PREFIX_PROMPT += f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
+        PREFIX_PROMPT += f"热词列表：[{hotwords}]\n"
+    
+    PREFIX_PROMPT += "\n语音转写：\n"
     
     prefix_tokens = text_to_tokens(vocab, PREFIX_PROMPT)
     suffix_tokens = text_to_tokens(vocab, SUFFIX_PROMPT)
@@ -533,22 +641,6 @@ def prepare_prompt_embeddings(vocab, embedding_table):
     print(f"    Suffix: {len(suffix_tokens)} tokens")
     
     return prefix_embd, suffix_embd, len(prefix_tokens), len(suffix_tokens)
-
-def process_audio_file(audio_path, ort_session):
-    """步骤 5: 加载并编码音频"""
-    print(f"\n[5] 加载并编码音频: {os.path.basename(audio_path)}")
-    
-    audio = load_audio(audio_path)
-    audio_len = len(audio)
-    print(f"    音频长度: {audio_len} samples ({audio_len/SAMPLE_RATE:.2f}s)")
-    
-    t_start = time.perf_counter()
-    query_embed = np.ones((1, 10, 1024), dtype=np.float32)
-    audio_embd = encode_audio(audio, ort_session, query_embed)
-    t_cost = time.perf_counter() - t_start
-    
-    print(f"    Audio Embedding: {audio_embd.shape} (耗时: {t_cost*1000:.2f}ms)")
-    return audio_embd, audio_len, t_cost
 
 def setup_inference_context(model, full_embd, n_tokens_input):
     """步骤 7: 创建上下文并注入 Embedding"""
@@ -659,70 +751,74 @@ def run_generation(ctx, vocab, eos_token, n_input_tokens):
 
 def main():
     print("=" * 70)
-    print("端到端 ASR 推理 (End-to-End ASR Inference)")
+    print("SenseVoice Hybrid ASR 推理 (CTC + LLM)")
     print("=" * 70)
     
     if QUIET_MODE:
         cb = LOG_CALLBACK(quiet_log_callback)
         llama_log_set(cb, None)
     
-    # 1. 加载 ONNX 编码器
-    ort_session, t_load_enc = load_onnx_model()
+    # 加载 ONNX Models
+    encoder_sess, ctc_sess, t_load_onnx = load_onnx_models()
     
-    # 2. 加载 GGUF 解码器
+    # 加载GGUF LLM Decoder
     model, vocab, eos_token, t_load_dec = load_gguf_model()
     if not model: return 1
     
-    # 3. 读取 Embedding 权重
+    # 加载 Embedding 权重
     embedding_table, t_load_embd = load_embedding_weights()
     if embedding_table is None: return 1
-
-    # 4. 准备提示词 (Prompts)
-    prefix_embd, suffix_embd, n_prefix, n_suffix = prepare_prompt_embeddings(vocab, embedding_table)
-    if prefix_embd is None: return 1
     
+    # 加载 CTC 词表
+    ctc_id2token = load_ctc_tokens(TOKENS_PATH)
+
     print("\n" + "=" * 70)
     print("模型加载完成，准备处理音频...")
     print("=" * 70)
     
-    # 5. 处理音频
-    audio_embd, audio_len, t_encode_audio = process_audio_file(INPUT_AUDIO, ort_session)
-    if np.isnan(audio_embd).any():
-        print("    [WARNING] Audio embedding contains NaN!")
+    # 音频编码
+    audio_embd, enc_output, audio_len, t_encode_audio = process_audio_file(INPUT_AUDIO, encoder_sess)
     
-    # 6. 拼接 (Concatenate)
-    print("\n[6] 拼接 embeddings [prefix + audio + suffix]...")
+    # CTC 解码
+    matched_hws, t_ctc_cost = run_ctc_pass(ctc_sess, enc_output, ctc_id2token, DEFAULT_HOTWORDS)
+    
+    # 准备提示词
+    prefix_embd, suffix_embd, n_prefix, n_suffix = prepare_prompt_embeddings(vocab, embedding_table, matched_hws)
+    
+    # 拼接 embd
     full_embd = np.concatenate([prefix_embd, audio_embd.astype(np.float32), suffix_embd], axis=0)
     n_input_tokens = full_embd.shape[0]
-    print(f"    总 embedding: {full_embd.shape}")
     
-    # 7. 创建上下文并注入 (Setup Context & Inject)
+    # 注入 embd
     ctx, t_inject = setup_inference_context(model, full_embd, n_input_tokens)
     if not ctx: return 1
     
-    # 8. 生成 (Generate)
+    # LLM 解码
     text, n_gen, t_gen = run_generation(ctx, vocab, eos_token, n_input_tokens)
     
-    # 9. 统计 (Stats)
-    tps = n_gen / t_gen if t_gen > 0 else 0
-    t_total = t_encode_audio + t_inject + t_gen
+    # 统计
+    tps_out = n_gen / t_gen if t_gen > 0 else 0
+    tps_in = n_input_tokens / t_inject if t_inject > 0 else 0
+    t_total = t_encode_audio + t_ctc_cost + t_inject + t_gen
     
-    print(f"\n[结果]")
-    print(f"  转录文本: {text}")
     print(f"\n[统计]")
     print(f"  音频长度: {audio_len/SAMPLE_RATE:.2f}s")
-    print(f"  Decoder输入: {n_input_tokens} (prefix:{n_prefix}, audio:{audio_embd.shape[0]}, suffix:{n_suffix})")
-    print(f"  Decoder输出: {tps:.2f} tokens/s ({n_gen} in {t_gen:.2f}s)")
-    print(f"\n[耗时]")
-    print(f"  - Encoder加载:   {t_load_enc*1000:5.0f}ms")
-    print(f"  - Decoder加载:   {t_load_dec*1000:5.0f}ms")
-    print(f"  - Embd   加载:   {t_load_embd*1000:5.0f}ms")
-    print(f"  - Encoder生成:   {t_encode_audio*1000:5.0f}ms")
-    print(f"  - Decoder读取:   {t_inject*1000:5.0f}ms")
-    print(f"  - Decoder生成:   {t_gen*1000:5.0f}ms")
-    print(f"  - 转录总耗时:      {t_total:5.2f}s")
+    print(f"  Decoder输入: {tps_in:5.0f} tokens/s (all: {n_input_tokens}, prefix:{n_prefix}, audio:{audio_embd.shape[0]}, suffix:{n_suffix})")
+    print(f"  Decoder输出: {tps_out:5.0f} tokens/s (all: {n_gen})")
+
+    print(f"\n[加载耗时]")
+    print(f"  - ONNX加载： {t_load_onnx*1000:5.0f}ms")
+    print(f"  - GGUF加载： {t_load_dec*1000:5.0f}ms")
+    print(f"  - Embd读取： {t_load_embd*1000:5.0f}ms")
     
-    # 清理 (Cleanup)
+    print(f"\n[转录耗时]")
+    print(f"  - 音频编码： {t_encode_audio*1000:5.0f}ms")
+    print(f"  - CTC解码：  {t_ctc_cost*1000:5.0f}ms")
+    print(f"  - LLM读取：  {t_inject*1000:5.0f}ms")
+    print(f"  - LLM生成：  {t_gen*1000:5.0f}ms")
+    print(f"  - 总耗时：   {t_total:5.2f}s")
+    
+    # 清理
     llama_free(ctx)
     llama_model_free(model)
     llama_backend_free()
