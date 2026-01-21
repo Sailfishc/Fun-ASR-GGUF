@@ -4,6 +4,7 @@ import torch
 import torchaudio
 import numpy as np
 import onnxruntime
+from onnxruntime.quantization import quantize_dynamic, QuantType
 import os
 from pydub import AudioSegment
 from funasr import AutoModel
@@ -24,12 +25,7 @@ tokenizer_path = r'./Fun-ASR-Nano-2512/Qwen3-0.6B'
 
 # 输出 ONNX 路径
 onnx_model_A = f'{OUTPUT_DIR}/FunASR_Nano_Encoder.onnx'
-onnx_model_B = f'{OUTPUT_DIR}/FunASR_Nano_Decoder_Embed.onnx'
-onnx_model_C = f'{OUTPUT_DIR}/FunASR_Nano_Decoder_Main.onnx'
-onnx_model_D = f'{OUTPUT_DIR}/FunASR_Nano_Greedy_Search.onnx'
-onnx_model_E = f'{OUTPUT_DIR}/FunASR_Nano_First_Beam_Search.onnx'
-onnx_model_F = f'{OUTPUT_DIR}/FunASR_Nano_Second_Beam_Search.onnx'
-onnx_model_G = f'{OUTPUT_DIR}/FunASR_Nano_Reset_Penality.onnx'
+onnx_model_A_int8 = f'{OUTPUT_DIR}/FunASR_Nano_Encoder.int8.onnx'
 
 # 参数配置
 SAMPLE_RATE = 16000
@@ -63,89 +59,6 @@ if HOP_LENGTH > MAX_INPUT_AUDIO_LENGTH:
 # =========================================================================
 # 模型类定义 (直接复制自导出脚本)
 # =========================================================================
-
-class GREEDY_SEARCH(torch.nn.Module):
-    def __init__(self):
-        super(GREEDY_SEARCH, self).__init__()
-        self.batch_indices = torch.arange(MAX_BEAM_SIZE, dtype=torch.int8)
-
-    def forward(self, logits, repeat_penality, penality_value, batch_size):
-        max_logits_idx = torch.argmax(logits * repeat_penality, dim=-1, keepdim=True)
-        batch_indices = self.batch_indices[:batch_size].long()
-        repeat_penality[batch_indices, max_logits_idx.squeeze(-1)] *= penality_value
-        return max_logits_idx.int(), repeat_penality
-
-
-class FIRST_BEAM_SEARCH(torch.nn.Module):
-    def __init__(self, num_layers):
-        super(FIRST_BEAM_SEARCH, self).__init__()
-        self.num_keys_values = num_layers + num_layers
-        self.save_keys_values = [None] * self.num_keys_values
-        self.batch_indices = torch.arange(MAX_BEAM_SIZE, dtype=torch.int8)
-
-    def forward(self, *all_inputs):
-        logits = all_inputs[-5]
-        save_id = all_inputs[-4]
-        repeat_penality = all_inputs[-3]
-        penality_value = all_inputs[-2]
-        beam_size = all_inputs[-1]
-        logits = torch.log_softmax(logits, dim=-1)
-        top_beam_prob, top_beam_indices = torch.topk(logits, dim=-1, k=beam_size, sorted=False, largest=True)
-        for i in range(self.num_keys_values):
-            self.save_keys_values[i] = all_inputs[i].repeat(beam_size, *([1] * (all_inputs[i].dim() - 1)))
-        top_beam_indices = top_beam_indices.transpose(0, 1)
-        batch_indices = self.batch_indices[:beam_size].long()
-        repeat_penality[batch_indices, top_beam_indices] *= penality_value
-        top_beam_indices = top_beam_indices.int()
-        save_id = torch.cat([save_id, top_beam_indices], dim=-1)
-        max_logits_idx = top_beam_indices[0]
-        return *self.save_keys_values, top_beam_indices, save_id, repeat_penality, top_beam_prob.transpose(0, 1), batch_indices, max_logits_idx
-
-
-class SECOND_BEAM_SEARCH(torch.nn.Module):
-    def __init__(self, num_layers):
-        super(SECOND_BEAM_SEARCH, self).__init__()
-        self.num_keys_values = num_layers + num_layers
-        self.save_keys_values = [None] * self.num_keys_values
-        self.batch_indices = torch.arange(MAX_BEAM_SIZE, dtype=torch.int8)
-
-    def forward(self, *all_inputs):
-        logits = all_inputs[-8]
-        save_id = all_inputs[-7]
-        repeat_penality = all_inputs[-6]
-        previous_prob = all_inputs[-5]
-        batch_indices = all_inputs[-4]
-        penality_value = all_inputs[-3]
-        beam_size = all_inputs[-2]
-        topK = all_inputs[-1]
-        logits = torch.log_softmax(logits * repeat_penality, dim=-1)
-        top_k_prob, top_k_indices = torch.topk(logits, k=topK, dim=-1, largest=True, sorted=False)
-        current_prob = (top_k_prob + previous_prob).view(-1)
-        top_beam_prob, top_beam_indices = torch.topk(current_prob, k=beam_size, dim=-1, largest=True, sorted=False)
-        beam_index = top_beam_indices // topK
-        top_beam_indices = top_k_indices.view(-1)[top_beam_indices]
-        for i in range(self.num_keys_values):
-            self.save_keys_values[i] = all_inputs[i][beam_index]
-        repeat_penality = repeat_penality[beam_index]
-        repeat_penality[batch_indices, top_beam_indices] *= penality_value
-        top_beam_indices = top_beam_indices.int()
-        max_logits_idx = top_beam_indices[[0]]
-        top_beam_indices = top_beam_indices.unsqueeze(-1)
-        save_id = torch.cat([save_id[beam_index], top_beam_indices], dim=-1)
-        return *self.save_keys_values, top_beam_indices, save_id, repeat_penality, top_beam_prob.unsqueeze(-1), max_logits_idx
-
-
-class RESET_PENALITY(torch.nn.Module):
-    def __init__(self):
-        super(RESET_PENALITY, self).__init__()
-        pass
-
-    def forward(self, save_id, repeat_penality, penality_reset_count, batch_indices):
-        repeat_penality[batch_indices, save_id[batch_indices, penality_reset_count[batch_indices]]] = 1.0
-        penality_reset_count += 1
-        return save_id, repeat_penality, penality_reset_count
-
-
 
 class FUNASR_NANO_ENCODER(torch.nn.Module):
     def __init__(self, funasr_nano, stft_model, nfft_stft, max_stft_len, n_mels, sample_rate, pre_emphasis, lfr_m, lfr_n, lfr_len):
@@ -244,79 +157,6 @@ class FUNASR_NANO_ENCODER(torch.nn.Module):
         return concat_embed, concat_embed.shape[1].unsqueeze(0)
 
 
-class FUNASR_NANO_DECODER_MAIN(torch.nn.Module):
-    def __init__(self, funasr_nano, max_seq_len, num_heads, num_key_value_heads, head_dim, num_layers):
-        super(FUNASR_NANO_DECODER_MAIN, self).__init__()
-        self.funasr_nano_decoder_main = funasr_nano.llm.float()
-        self.head_dim = head_dim
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.num_key_value_heads = num_key_value_heads
-        self.head_dim_half = head_dim // 2
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.variance_epsilon = float(1e-6)
-        self.scale_factor = float(head_dim ** -0.25)
-
-        position_ids = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(-1)
-        idx_theta = (position_ids * self.funasr_nano_decoder_main.model.rotary_emb.inv_freq).unsqueeze(0).unsqueeze(0)
-        cos_rotary_pos_emb = torch.cos(idx_theta) * self.scale_factor
-        sin_rotary_pos_emb = torch.sin(idx_theta) * self.scale_factor
-        self.cos_rotary_pos_emb = torch.cat((cos_rotary_pos_emb, cos_rotary_pos_emb), dim=-1).half()
-        self.sin_rotary_pos_emb = torch.cat((sin_rotary_pos_emb, sin_rotary_pos_emb), dim=-1).half()
-
-        self.save_key = [None] * num_layers
-        self.save_value = [None] * num_layers
-        self.attention_mask = (1 - torch.tril(torch.ones([1, 1, max_seq_len, max_seq_len], dtype=torch.int8))) * -128
-
-    def rotate_half(self, x, head_dim_half, dim):
-        x1, x2 = torch.split(x, [head_dim_half, head_dim_half], dim=dim)
-        return torch.cat((-x2, x1), dim=dim)
-
-    def repeat_k(self, kv_states, num_key_value_groups, head_dim, num_heads, batch_size):
-        return torch.cat([kv_states for _ in range(num_key_value_groups)], dim=2).view(batch_size, num_heads, head_dim, -1)
-
-    def repeat_v(self, kv_states, num_key_value_groups, head_dim, num_heads, batch_size):
-        return torch.cat([kv_states for _ in range(num_key_value_groups)], dim=2).view(batch_size, num_heads, -1, head_dim)
-
-    def forward(self, *all_inputs):
-        hidden_states = all_inputs[-4]
-        history_len = all_inputs[-3]
-        ids_len = all_inputs[-2]
-        kv_seq_len = history_len + ids_len
-        rotary_pos_emb_cos_q = self.cos_rotary_pos_emb[..., history_len:kv_seq_len, :].float()
-        rotary_pos_emb_sin_q = self.sin_rotary_pos_emb[..., history_len:kv_seq_len, :].float()
-        rotary_pos_emb_cos_k = rotary_pos_emb_cos_q.transpose(-1, -2).unsqueeze(0)
-        rotary_pos_emb_sin_k = rotary_pos_emb_sin_q.transpose(-1, -2).unsqueeze(0)
-        attention_mask = (self.attention_mask[..., :ids_len, :kv_seq_len] * all_inputs[-1]).float()
-        batch_size = hidden_states.shape[0].unsqueeze(0)
-        for i, layer in enumerate(self.funasr_nano_decoder_main.model.layers):
-            hidden_states_norm = layer.input_layernorm.weight * (hidden_states / torch.sqrt(hidden_states.pow(2).mean(-1, keepdim=True) + self.variance_epsilon))
-            q = layer.self_attn.q_proj(hidden_states_norm).view(batch_size, -1, self.num_heads, self.head_dim)
-            k = layer.self_attn.k_proj(hidden_states_norm).view(batch_size, -1, 1, self.num_key_value_heads, self.head_dim)
-            v = layer.self_attn.v_proj(hidden_states_norm).view(batch_size, -1, 1, self.num_key_value_heads, self.head_dim).transpose(1, 3)
-            q = (layer.self_attn.q_norm.weight * (q / torch.sqrt(q.pow(2).mean(-1, keepdim=True) + self.variance_epsilon))).transpose(1, 2)
-            k = (layer.self_attn.k_norm.weight * (k / torch.sqrt(k.pow(2).mean(-1, keepdim=True) + self.variance_epsilon))).permute(0, 3, 2, 4, 1)
-            q = q * rotary_pos_emb_cos_q + self.rotate_half(q, self.head_dim_half, -1) * rotary_pos_emb_sin_q
-            k = k * rotary_pos_emb_cos_k + self.rotate_half(k, self.head_dim_half, -2) * rotary_pos_emb_sin_k
-            k = torch.cat((all_inputs[i], k), dim=-1)
-            v = torch.cat((all_inputs[i + self.num_layers], v), dim=-2)
-            self.save_key[i] = k
-            self.save_value[i] = v
-            k = self.repeat_k(k, self.num_key_value_groups, self.head_dim, self.num_heads, batch_size)
-            v = self.repeat_v(v, self.num_key_value_groups, self.head_dim, self.num_heads, batch_size)
-            attn = torch.nn.functional.softmax(torch.matmul(q, k) + attention_mask, dim=-1, dtype=torch.float32)
-            attn_out = layer.self_attn.o_proj(torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch_size, -1, layer.self_attn.o_proj.in_features))
-            hidden_states += attn_out
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm.weight * (hidden_states / torch.sqrt(hidden_states.pow(2).mean(-1, keepdim=True) + self.variance_epsilon))
-            hidden_states = layer.mlp.down_proj(layer.mlp.act_fn(layer.mlp.gate_proj(hidden_states)) * layer.mlp.up_proj(hidden_states))
-            hidden_states += residual
-        hidden_states = hidden_states[:, -1]
-        hidden_states = self.funasr_nano_decoder_main.model.norm.weight * (hidden_states / torch.sqrt(hidden_states.pow(2).mean(-1, keepdim=True) + self.variance_epsilon))
-        logits = self.funasr_nano_decoder_main.lm_head(hidden_states)
-        return *self.save_key, *self.save_value, logits, kv_seq_len
-
-
 # =========================================================================
 # 主流程
 # =========================================================================
@@ -331,7 +171,6 @@ def export():
         custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH, hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
         
         # 加载完整模型
-        # 注意: FunASR AutoModel 会加载 model.pt (包含 LLM 和 Encoder)
         model = AutoModel(
             model=model_path,
             trust_remote_code=True,
@@ -340,11 +179,6 @@ def export():
             disable_update=True
         )
 
-        num_heads = model.model.llm.config.num_attention_heads
-        num_key_value_heads = model.model.llm.config.num_key_value_heads
-        head_dim = model.model.llm.config.head_dim
-        num_layers = model.model.llm.config.num_hidden_layers
-        vocab_size = model.model.llm.model.vocab_size
         hidden_size = model.model.llm.model.embed_tokens.embedding_dim
         
         # 1. Export Audio Encoder
@@ -370,10 +204,25 @@ def export():
         del funasr_nano_encoder, audio, custom_stft
         gc.collect()
 
-        print('\nAll ONNX models exported successfully to:', OUTPUT_DIR)
+        print('\n[FP32] OFFX exported to:', onnx_model_A)
+        
+        # 2. Quantize to INT8
+        print(f"\n[INT8] Quantizing to {onnx_model_A_int8} ...")
+        
+        # 定义需要排除的节点 (参考 FunASR)
+        # nodes_to_exclude = [] # 如果需要排除输出层或其他敏感层
+        
+        quantize_dynamic(
+            model_input=onnx_model_A,
+            model_output=onnx_model_A_int8,
+            op_types_to_quantize=["MatMul"], # 关键：只量化矩阵乘法，避免其他算子的动态转换开销
+            per_channel=True,                # 关键：逐通道量化，精度更高
+            reduce_range=False,              # 不降低范围 (使用完整 int8 范围)
+            weight_type=QuantType.QUInt8
+        )
+        print(f"[INT8] Quantization finished: {onnx_model_A_int8}")
         
     print('\nExport flow finished.')
 
 if __name__ == "__main__":
     export()
-
