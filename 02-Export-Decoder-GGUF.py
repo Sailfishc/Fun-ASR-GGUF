@@ -1,4 +1,3 @@
-
 import torch
 import os
 import json
@@ -19,8 +18,9 @@ OUTPUT_HF_DIR = './model-gguf/Qwen3-0.6B'
 # Tokenizer 输出路径
 OUTPUT_TOKENIZER_DIR = './model-gguf/Qwen3-0.6B'
 
-# 最终 GGUF 输出文件 (Int8/Q8_0)
-OUTPUT_GGUF_FILE = './model-gguf/qwen3-0.6b-asr-q8_0.gguf'
+# 最终 GGUF 输出文件
+OUTPUT_GGUF_FILE_FP16 = './model-gguf/Fun-ASR-Nano-Decoder.fp16.gguf'
+OUTPUT_GGUF_FILE_INT8 = './model-gguf/Fun-ASR-Nano-Decoder.q8_0.gguf'
 
 # Llama.cpp 路径 (自动寻找 convert_hf_to_gguf.py)
 # 优先尝试 llama.cpp 目录，如果不存在尝试 llama.cpp-master
@@ -37,30 +37,29 @@ CONVERT_SCRIPT = f'{LLAMA_CPP_PATH}/convert_hf_to_gguf.py'
 
 def main():
     # ---------------------------------------------------------------------
-    # 1. 提取 LLM 并保存为 Hugging Face 格式 (如果已存在则跳过，为了节省时间)
+    # 1. 提取 LLM 并保存为 Hugging Face 格式
     # ---------------------------------------------------------------------
     print("\n[Stage 1] Checking/Extracting LLM Decoder to Hugging Face format...")
     
-    # 简单的检查，如果 config.json 和 safetensors 存在，假设已经解压过了，可以选择跳过
-    # 为了保险起见，这里还是执行一遍提取逻辑，但你可以手动注释掉如果这步耗时太长
-    
-    # 尝试导入 Qwen3 类
-    try:
-        from transformers import Qwen3ForCausalLM, Qwen3Config
-    except ImportError:
-        try:
-            from transformers import Qwen2ForCausalLM as Qwen3ForCausalLM
-            from transformers import Qwen2Config as Qwen3Config
-        except ImportError:
-            from transformers import AutoModelForCausalLM as Qwen3ForCausalLM
-            from transformers import AutoConfig as Qwen3Config
-
-    # 加载完整 PyTorch 模型 (FunASR 格式)
-    model_pt_path = f'{SOURCE_MODEL_PATH}/model.pt'
-    
+    # 检查是否已存在 HF 模型，存在则跳过提取
     if os.path.exists(os.path.join(OUTPUT_HF_DIR, "model.safetensors")):
          print(f"HF model appears to exist in {OUTPUT_HF_DIR}. Skipping extraction.")
     else:
+        # 尝试导入 Qwen3 类 (参考 save_standard_hf_model.py)
+        try:
+            from transformers import Qwen3ForCausalLM, Qwen3Config
+            print("Successfully imported Qwen3ForCausalLM and Qwen3Config")
+        except ImportError:
+            print("Warning: Qwen3 classes not found in transformers, falling back to Qwen2 or AutoClasses.")
+            try:
+                from transformers import Qwen2ForCausalLM as Qwen3ForCausalLM
+                from transformers import Qwen2Config as Qwen3Config
+            except ImportError:
+                from transformers import AutoModelForCausalLM as Qwen3ForCausalLM
+                from transformers import AutoConfig as Qwen3Config
+
+        # 加载完整 PyTorch 模型 (FunASR 格式)
+        model_pt_path = f'{SOURCE_MODEL_PATH}/model.pt'
         print(f"Loading full model from {model_pt_path} ...")
         full_model = torch.load(model_pt_path, map_location='cpu')
 
@@ -111,32 +110,54 @@ def main():
         print("HF Model and Tokenizer saved successfully.")
 
     # ---------------------------------------------------------------------
-    # 2. 转换为 GGUF 格式 (Int8)
+    # 2. 转换为 GGUF 格式 (FP16 & Int8)
     # ---------------------------------------------------------------------
-    print("\n[Stage 2] Converting HF model to GGUF (Int8 - q8_0)...")
+    print("\n[Stage 2] Converting HF model to GGUF...")
     
     if not os.path.exists(CONVERT_SCRIPT):
         print(f"Error: Llama.cpp conversion script not found at {CONVERT_SCRIPT}")
-        return
+        # Try finding it
+        print("Attempting to locate convert_hf_to_gguf.py ...")
+        # simple search
+        possible_paths = [
+            './llama.cpp/convert_hf_to_gguf.py',
+            './llama.cpp-master/convert_hf_to_gguf.py',
+            './llama.cpp/llama.cpp/convert_hf_to_gguf.py'
+        ]
+        for p in possible_paths:
+            if os.path.exists(p):
+                print(f"Found at {p}")
+                con_script = p
+                break
+        else:
+             print("Could not find conversion script. Please check your llama.cpp installation.")
+             return
+    else:
+        con_script = CONVERT_SCRIPT
 
-    # 构建命令
-    # python convert.py model_dir --outfile ... --outtype q8_0
-    
-    cmd = [
-        sys.executable,
-        CONVERT_SCRIPT,
-        OUTPUT_HF_DIR,
-        '--outfile', OUTPUT_GGUF_FILE,
-        '--outtype', 'q8_0',  # <-- Key change here
+    # 定义转换任务列表: (输出路径, 量化类型)
+    tasks = [
+        (OUTPUT_GGUF_FILE_FP16, 'f16'),
+        (OUTPUT_GGUF_FILE_INT8, 'q8_0')
     ]
-    
-    print(f"Executing: {' '.join(cmd)}")
-    
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"\n✅ GGUF Int8 conversion successful! Output: {OUTPUT_GGUF_FILE}")
-    except subprocess.CalledProcessError as e:
-        print(f"\n❌ GGUF conversion failed with error: {e}")
+
+    for output_file, out_type in tasks:
+        print(f"\n---> Exporting {out_type} model to {output_file} ...")
+        cmd = [
+            sys.executable,
+            con_script,
+            OUTPUT_HF_DIR,
+            '--outfile', output_file,
+            '--outtype', out_type,
+        ]
+        
+        print(f"Executing: {' '.join(cmd)}")
+        
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"✅ GGUF {out_type} conversion successful! Output: {output_file}")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ GGUF {out_type} conversion failed with error: {e}")
 
 if __name__ == "__main__":
     main()

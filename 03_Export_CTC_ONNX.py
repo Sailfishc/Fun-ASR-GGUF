@@ -1,0 +1,216 @@
+
+import gc
+import time
+import torch
+import torchaudio
+import numpy as np
+import onnxruntime
+from onnxruntime.quantization import quantize_dynamic, QuantType
+import os
+from funasr import AutoModel
+from STFT_Process import STFT_Process
+
+# =========================================================================
+# 配置部分
+# =========================================================================
+
+# 输出目录
+OUTPUT_DIR = r'./model-gguf'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# 源模型路径
+model_path = r'./Fun-ASR-Nano-2512'
+
+# 输出 ONNX 路径
+onnx_model_ctc = f'{OUTPUT_DIR}/Fun-ASR-Nano-CTC.fp32.onnx'
+onnx_model_ctc_int8 = f'{OUTPUT_DIR}/Fun-ASR-Nano-CTC.int8.onnx'
+
+# 参数配置 (与 01 保持一致)
+SAMPLE_RATE = 16000
+WINDOW_TYPE = 'hamming'
+N_MELS = 80
+NFFT_STFT = 400
+WINDOW_LENGTH = 400
+HOP_LENGTH = 160
+PRE_EMPHASIZE = 0.97
+USE_NORMALIZER = True
+LFR_M = 7
+LFR_N = 6
+MAX_INPUT_AUDIO_LENGTH = SAMPLE_RATE * 30 # 30s
+DYNAMIC_AXES = True
+OPSET = 17
+
+MAX_STFT_SIGNAL_LENGTH = MAX_INPUT_AUDIO_LENGTH // HOP_LENGTH + 1
+LFR_LENGTH = (MAX_STFT_SIGNAL_LENGTH + LFR_N - 1) // LFR_N
+if HOP_LENGTH > MAX_INPUT_AUDIO_LENGTH:
+    HOP_LENGTH = MAX_INPUT_AUDIO_LENGTH
+
+# =========================================================================
+# 模型类定义
+# =========================================================================
+
+class FUNASR_NANO_CTC(torch.nn.Module):
+    def __init__(self, funasr_nano, stft_model, nfft_stft, max_stft_len, n_mels, sample_rate, pre_emphasis, lfr_m, lfr_n, lfr_len):
+        super(FUNASR_NANO_CTC, self).__init__()
+        self.funasr_nano = funasr_nano.float()
+        self.stft_model = stft_model
+        
+        # Audio Encoder Params
+        self.T_lfr = lfr_len
+        self.lfr_n = lfr_n
+        self.pre_emphasis = torch.tensor(pre_emphasis, dtype=torch.float32).view(1, 1, -1)
+        self.fbank = (torchaudio.functional.melscale_fbanks(nfft_stft // 2 + 1, 20, sample_rate // 2, n_mels, sample_rate, None,'htk')).transpose(0, 1).unsqueeze(0)
+        self.nfft_stft = nfft_stft
+        self.lfr_m_factor = (lfr_m - 1) // 2
+        indices = torch.arange(0, self.T_lfr * lfr_n, lfr_n, dtype=torch.int32).unsqueeze(1) + torch.arange(lfr_m, dtype=torch.int32)
+        self.indices_mel = indices.clamp(max=max_stft_len + self.lfr_m_factor - 1).to(torch.int16)
+        
+        # Encoder Init (Copied from 01)
+        self.output_size_factor = self.funasr_nano.audio_encoder.output_size() ** 0.5
+        self.position_encoding = self.funasr_nano.audio_encoder.embed(torch.zeros([1, max_stft_len, 560], dtype=torch.float32))
+        
+        num_head = self.funasr_nano.audio_encoder.encoders._modules["0"].self_attn.h
+        head_dim = self.funasr_nano.audio_encoder.encoders._modules["0"].self_attn.d_k
+        self.pad_zeros = torch.zeros((1, num_head * head_dim, 5), dtype=torch.float32)
+        factor = float(head_dim ** (-0.25))
+        in_size = self.funasr_nano.audio_encoder.encoders._modules["0"].in_size
+        
+        self.total_encoders = list(self.funasr_nano.audio_encoder.encoders0) + list(self.funasr_nano.audio_encoder.encoders) + list(self.funasr_nano.audio_encoder.tp_encoders)
+        for encoder_layer in self.total_encoders:
+            encoder_layer.self_attn.linear_q_k_v.weight.data[:-in_size] *= factor
+            encoder_layer.self_attn.linear_q_k_v.bias.data[:-in_size] *= factor
+
+        self.fake_token = torch.zeros(max_stft_len + 1, dtype=torch.int16)
+        for i in range(self.fake_token.shape[0]):
+            self.fake_token[i] = (((i - 1) // 2 + 1 - 1) // 2 + 1 - 1) // 2 + 1
+            
+        # CTC Decoder Init
+        # ctc_decoder is typically a Transformer
+        # We need to see if we can use it directly or need to unpack
+        # For now, let's try calling it directly. If that fails, we unpack.
+        # But wait, we need to handle inputs.
+        
+    def forward(self, audio):
+        # 1. Audio Processing (STFT -> Mel)
+        audio = audio.float()
+        audio = audio - torch.mean(audio)
+        if self.pre_emphasis > 0:
+            audio = torch.cat([audio[..., :1], audio[..., 1:] - self.pre_emphasis * audio[..., :-1]], dim=-1)
+        real_part, imag_part = self.stft_model(audio, 'constant')
+        mel_features = (torch.matmul(self.fbank, real_part * real_part + imag_part * imag_part).transpose(1, 2) + 1e-7).log()
+        
+        # 2. LFR (Low Frame Rate)
+        features_len = mel_features.shape[1].unsqueeze(0)
+        left_padding = mel_features[:, [0]]
+        padded_inputs = torch.cat([left_padding] * self.lfr_m_factor + [mel_features], dim=1)
+        _len = features_len // self.lfr_n - 1
+        mel_features = padded_inputs[:, self.indices_mel[:_len].int()].reshape(1, _len, -1)
+        
+        # 3. Encoder Forward
+        x = mel_features * self.output_size_factor + self.position_encoding[:, :_len].float()
+        
+        # Encoder Layers (Manually Unrolled as in 01 for consistency/safety)
+        for encoder_layer in self.funasr_nano.audio_encoder.encoders0 + self.funasr_nano.audio_encoder.encoders:
+            x1 = encoder_layer.norm1(x)
+            qkv = encoder_layer.self_attn.linear_q_k_v(x1)
+            q_h, k_h, v = torch.split(qkv, encoder_layer.size, dim=-1)
+            q_h = q_h.view(-1, encoder_layer.self_attn.h, encoder_layer.self_attn.d_k).transpose(0, 1)
+            k_h = k_h.view(-1, encoder_layer.self_attn.h, encoder_layer.self_attn.d_k).permute(1, 2, 0)
+            v_h = v.view(-1, encoder_layer.self_attn.h, encoder_layer.self_attn.d_k).transpose(0, 1)
+            fsmn_memory = encoder_layer.self_attn.fsmn_block(torch.cat([self.pad_zeros, v.transpose(1, 2), self.pad_zeros], dim=-1)).transpose(1, 2) + v
+            attn = torch.matmul(torch.softmax(torch.matmul(q_h, k_h), dim=-1), v_h).transpose(0, 1).contiguous().view(1, -1, encoder_layer.self_attn.linear_out.in_features)
+            attn = encoder_layer.self_attn.linear_out(attn) + fsmn_memory
+            if encoder_layer.in_size == encoder_layer.size:
+                x += attn
+            else:
+                x = attn
+            x = x + encoder_layer.feed_forward(encoder_layer.norm2(x))
+            
+        x = self.funasr_nano.audio_encoder.after_norm(x)
+        
+        for encoder_layer in self.funasr_nano.audio_encoder.tp_encoders:
+            x1 = encoder_layer.norm1(x)
+            qkv = encoder_layer.self_attn.linear_q_k_v(x1)
+            q_h, k_h, v = torch.split(qkv, encoder_layer.size, dim=-1)
+            q_h = q_h.view(-1, encoder_layer.self_attn.h, encoder_layer.self_attn.d_k).transpose(0, 1)
+            k_h = k_h.view(-1, encoder_layer.self_attn.h, encoder_layer.self_attn.d_k).permute(1, 2, 0)
+            v_h = v.view(-1, encoder_layer.self_attn.h, encoder_layer.self_attn.d_k).transpose(0, 1)
+            fsmn_memory = encoder_layer.self_attn.fsmn_block(torch.cat([self.pad_zeros, v.transpose(1, 2), self.pad_zeros], dim=-1)).transpose(1, 2) + v
+            attn = torch.matmul(torch.softmax(torch.matmul(q_h, k_h), dim=-1), v_h).transpose(0, 1).contiguous().view(1, -1, encoder_layer.self_attn.linear_out.in_features)
+            attn = encoder_layer.self_attn.linear_out(attn) + fsmn_memory
+            x += attn
+            x = x + encoder_layer.feed_forward(encoder_layer.norm2(x))
+            
+        x = self.funasr_nano.audio_encoder.tp_norm(x)
+        
+        # 4. CTC Decoder Forward
+        # x shape: [Batch, T, D=512]
+        # FunASR CTC Decoder (Transformer) expects (x, lengths)
+        # lengths is not strictly needed for export if we don't use padding mask heavily or if it handles it.
+        # Let's create dummy lengths
+        olens = torch.full((x.shape[0],), x.shape[1], device=x.device, dtype=torch.long)
+        
+        ctc_out, _ = self.funasr_nano.ctc_decoder(x, olens)
+        # ctc_out shape: [Batch, T, D=512]
+        
+        # 5. CTC Projection & LogSoftmax
+        logits = self.funasr_nano.ctc.log_softmax(ctc_out)
+        
+        return logits, olens
+
+def export():
+    print('\n[CTC] Export start ...\n')
+    device = "cpu"
+    
+    with torch.inference_mode():
+        custom_stft = STFT_Process(model_type='stft_B', n_fft=NFFT_STFT, win_length=WINDOW_LENGTH, hop_len=HOP_LENGTH, max_frames=0, window_type=WINDOW_TYPE).eval()
+        
+        print(f"Loading model from {model_path} ...")
+        model = AutoModel(
+            model=model_path,
+            trust_remote_code=True,
+            remote_code="./Fun-ASR/model.py", 
+            device=device,
+            disable_update=True
+        )
+
+        print(f"Exporting CTC Decoder to {onnx_model_ctc} ...")
+        
+        funasr_nano_ctc = FUNASR_NANO_CTC(model.model, custom_stft, NFFT_STFT, MAX_STFT_SIGNAL_LENGTH, N_MELS, SAMPLE_RATE, PRE_EMPHASIZE, LFR_M, LFR_N, LFR_LENGTH)
+        
+        audio = torch.ones((1, 1, MAX_INPUT_AUDIO_LENGTH), dtype=torch.int16)
+        
+        torch.onnx.export(
+            funasr_nano_ctc,
+            (audio,),
+            onnx_model_ctc,
+            input_names=['audio'],
+            output_names=['logits', 'token_nums'],
+            do_constant_folding=True,
+            dynamic_axes={
+                'audio': {2: 'audio_len'},
+                'logits': {1: 'num_token'},
+                'token_nums': {0: 'batch'} # Although batch is 1 usually
+            } if DYNAMIC_AXES else None,
+            opset_version=OPSET,
+            dynamo=False
+        )
+        del funasr_nano_ctc, audio, custom_stft
+        gc.collect()
+
+        print('\n[CTC FP32] ONNX exported to:', onnx_model_ctc)
+        
+        # Quantize
+        print(f"\n[CTC INT8] Quantizing to {onnx_model_ctc_int8} ...")
+        quantize_dynamic(
+            model_input=onnx_model_ctc,
+            model_output=onnx_model_ctc_int8,
+            op_types_to_quantize=["MatMul"],
+            per_channel=True,
+            reduce_range=False,
+            weight_type=QuantType.QUInt8
+        )
+        print(f"[CTC INT8] Quantization finished: {onnx_model_ctc_int8}")
+
+if __name__ == "__main__":
+    export()

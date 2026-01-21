@@ -40,14 +40,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 模型路径
 MODEL_DIR = os.path.join(SCRIPT_DIR, "model-gguf")
+ENCODER_ONNX_PATH = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Encoder.int8.onnx")  
+DECODER_GGUF_PATH = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Decoder.q8_0.gguf")
+
+# llama.cpp 编译版本的 DLL 所在目录
+# 下载地址：https://github.com/ggml-org/llama.cpp/releases/download/b7786/llama-b7786-bin-win-vulkan-x64.zip
 BIN_DIR = os.path.join(SCRIPT_DIR, "bin")
-
-# GGUF 解码器 - 请确保此路径正确！
-# GGUF_MODEL_PATH = os.path.join(MODEL_DIR, "qwen3-0.6b-asr.gguf")
-GGUF_MODEL_PATH = os.path.join(MODEL_DIR, "qwen3-0.6b-asr-q8_0.gguf")
-
-ONNX_ENCODER_PATH = os.path.join(MODEL_DIR, "FunASR_Nano_Encoder.int8.onnx")  # ONNX 编码器
-
 GGML_DLL_PATH = os.path.join(BIN_DIR, "ggml.dll")
 LLAMA_DLL_PATH = os.path.join(BIN_DIR, "llama.dll")
 GGML_BASE_DLL_PATH = os.path.join(BIN_DIR, "ggml-base.dll")
@@ -57,10 +55,10 @@ INPUT_AUDIO = os.path.join(SCRIPT_DIR, "input.mp3")
 
 
 # ASR Prompts
-hotwords = '睡前消息'
+hotwords = '睡前消息, Claude Code'
 PREFIX_PROMPT = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-# PREFIX_PROMPT += f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
-# PREFIX_PROMPT += f"热词列表：[{hotwords}]\n"
+PREFIX_PROMPT += f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
+PREFIX_PROMPT += f"热词列表：[{hotwords}]\n"
 PREFIX_PROMPT += "\n语音转写：\n"
 SUFFIX_PROMPT = "\n<|im_end|>\n<|im_start|>assistant"
 STOP_TOKENS = [151643, 151645]
@@ -334,7 +332,7 @@ def get_token_embeddings_gguf(model_path, cache_dir=None):
         cache_dir = os.path.dirname(model_path)
     
     model_name = os.path.splitext(os.path.basename(model_path))[0]
-    cache_path = os.path.join(cache_dir, f"{model_name}_token_embd.npy")
+    cache_path = os.path.join(cache_dir, f"{model_name}.embd.npy")
     
     # 如果缓存存在且比模型新，直接加载
     if os.path.exists(cache_path):
@@ -474,12 +472,12 @@ def load_onnx_model():
     session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     
     ort_session = onnxruntime.InferenceSession(
-        ONNX_ENCODER_PATH, 
+        ENCODER_ONNX_PATH, 
         sess_options=session_opts, 
         providers=['CPUExecutionProvider']
     )
     t_cost = time.perf_counter() - t_start
-    print(f"    Encoder: {os.path.basename(ONNX_ENCODER_PATH)}")
+    print(f"    Encoder: {os.path.basename(ENCODER_ONNX_PATH)}")
     return ort_session, t_cost
 
 def load_gguf_model():
@@ -490,33 +488,41 @@ def load_gguf_model():
     llama_backend_init()
     
     model_params = llama_model_default_params()
-    model = llama_model_load_from_file(GGUF_MODEL_PATH.encode('utf-8'), model_params)
+    model = llama_model_load_from_file(DECODER_GGUF_PATH.encode('utf-8'), model_params)
     
     t_cost = time.perf_counter() - t_start
     if not model:
         print("    ERROR: Failed to load model")
         return None, None, None, None, t_cost
         
-    print(f"    Decoder: {os.path.basename(GGUF_MODEL_PATH)} (耗时: {t_cost:.2f}s)")
+    print(f"    Decoder: {os.path.basename(DECODER_GGUF_PATH)} (耗时: {t_cost:.2f}s)")
     
     vocab = llama_model_get_vocab(model)
     eos_token = llama_vocab_eos(vocab)
     
     return model, vocab, eos_token, t_cost
 
-def prepare_prompt_embeddings(model, vocab):
-    """步骤 3 & 4: 读取权重并生成提示词 Embedding"""
-    print("\n[3] 读取 token embedding 权重...")
+def load_embedding_weights():
+    """步骤 3: 加载 token embedding 权重"""
+    print("\n[3] 加载 token embedding 权重...")
     t_start = time.perf_counter()
     
-    embedding_table = get_token_embeddings_gguf(GGUF_MODEL_PATH)
+    embedding_table = get_token_embeddings_gguf(DECODER_GGUF_PATH)
     if embedding_table is None:
-        return None, None, None, 0
+        return None, 0
     
     t_read = time.perf_counter() - t_start
     print(f"    Embedding table: {embedding_table.shape} (耗时: {t_read*1000:.2f}ms)")
-    
+    return embedding_table, t_read
+
+def prepare_prompt_embeddings(vocab, embedding_table):
+    """步骤 4: 生成提示词 Embedding"""
     print("\n[4] 生成 prefix/suffix embeddings...")
+
+    # 如果 embedding_table 是 None (比如加载失败)，直接返回 None
+    if embedding_table is None:
+        return None, None, 0, 0
+    
     prefix_tokens = text_to_tokens(vocab, PREFIX_PROMPT)
     suffix_tokens = text_to_tokens(vocab, SUFFIX_PROMPT)
     
@@ -526,7 +532,7 @@ def prepare_prompt_embeddings(model, vocab):
     print(f"    Prefix: {len(prefix_tokens)} tokens")
     print(f"    Suffix: {len(suffix_tokens)} tokens")
     
-    return prefix_embd, suffix_embd, len(prefix_tokens), len(suffix_tokens), t_read
+    return prefix_embd, suffix_embd, len(prefix_tokens), len(suffix_tokens)
 
 def process_audio_file(audio_path, ort_session):
     """步骤 5: 加载并编码音频"""
@@ -660,40 +666,44 @@ def main():
         cb = LOG_CALLBACK(quiet_log_callback)
         llama_log_set(cb, None)
     
-    # 1. Load ONNX Encoder
+    # 1. 加载 ONNX 编码器
     ort_session, t_load_enc = load_onnx_model()
     
-    # 2. Load GGUF Decoder
+    # 2. 加载 GGUF 解码器
     model, vocab, eos_token, t_load_dec = load_gguf_model()
     if not model: return 1
     
-    # 3 & 4. Prepare Prompts
-    prefix_embd, suffix_embd, n_prefix, n_suffix, t_read_embd = prepare_prompt_embeddings(model, vocab)
+    # 3. 读取 Embedding 权重
+    embedding_table, t_load_embd = load_embedding_weights()
+    if embedding_table is None: return 1
+
+    # 4. 准备提示词 (Prompts)
+    prefix_embd, suffix_embd, n_prefix, n_suffix = prepare_prompt_embeddings(vocab, embedding_table)
     if prefix_embd is None: return 1
     
     print("\n" + "=" * 70)
     print("模型加载完成，准备处理音频...")
     print("=" * 70)
     
-    # 5. Process Audio
+    # 5. 处理音频
     audio_embd, audio_len, t_encode_audio = process_audio_file(INPUT_AUDIO, ort_session)
     if np.isnan(audio_embd).any():
         print("    [WARNING] Audio embedding contains NaN!")
     
-    # 6. Concatenate
+    # 6. 拼接 (Concatenate)
     print("\n[6] 拼接 embeddings [prefix + audio + suffix]...")
     full_embd = np.concatenate([prefix_embd, audio_embd.astype(np.float32), suffix_embd], axis=0)
     n_input_tokens = full_embd.shape[0]
     print(f"    总 embedding: {full_embd.shape}")
     
-    # 7. Setup Context & Inject
+    # 7. 创建上下文并注入 (Setup Context & Inject)
     ctx, t_inject = setup_inference_context(model, full_embd, n_input_tokens)
     if not ctx: return 1
     
-    # 8. Generate
+    # 8. 生成 (Generate)
     text, n_gen, t_gen = run_generation(ctx, vocab, eos_token, n_input_tokens)
     
-    # 9. Stats
+    # 9. 统计 (Stats)
     tps = n_gen / t_gen if t_gen > 0 else 0
     t_total = t_encode_audio + t_inject + t_gen
     
@@ -706,13 +716,13 @@ def main():
     print(f"\n[耗时]")
     print(f"  - Encoder加载:   {t_load_enc*1000:5.0f}ms")
     print(f"  - Decoder加载:   {t_load_dec*1000:5.0f}ms")
-    print(f"  - Embd 读取:     {t_read_embd*1000:5.0f}ms")
-    print(f"  - 音频编码:      {t_encode_audio*1000:5.0f}ms")
+    print(f"  - Embd   加载:   {t_load_embd*1000:5.0f}ms")
+    print(f"  - Encoder生成:   {t_encode_audio*1000:5.0f}ms")
     print(f"  - Decoder读取:   {t_inject*1000:5.0f}ms")
     print(f"  - Decoder生成:   {t_gen*1000:5.0f}ms")
-    print(f"  - 转录总耗时:        {t_total:5.2f}s")
+    print(f"  - 转录总耗时:      {t_total:5.2f}s")
     
-    # Cleanup
+    # 清理 (Cleanup)
     llama_free(ctx)
     llama_model_free(model)
     llama_backend_free()
