@@ -630,9 +630,9 @@ def prepare_prompt_embeddings(vocab, embedding_table, matched_hotwords=None, lan
     """步骤 6: 生成 Prompt"""
     print(f"\n[6] 生成 Prompt (语言: {language})")
     
-    PREFIX_PROMPT = "<|im_start|>system\n'
-    PREFIX_PROMPT += 'You are a helpful assistant."
-    PREFIX_PROMPT += '<|im_end|>\n<|im_start|>user\n"
+    PREFIX_PROMPT = "<|im_start|>system\n"
+    PREFIX_PROMPT += "You are a helpful assistant."
+    PREFIX_PROMPT += "<|im_end|>\n<|im_start|>user\n"
 
     if matched_hotwords:
         hotwords = ", ".join(matched_hotwords)
@@ -643,7 +643,7 @@ def prepare_prompt_embeddings(vocab, embedding_table, matched_hotwords=None, lan
         PREFIX_PROMPT += "语音转写："
     else:
         PREFIX_PROMPT += f"语音转写成{language}："
-        
+
     SUFFIX_PROMPT = "<|im_end|>\n<|im_start|>assistant\n"
     
     prefix_tokens = text_to_tokens(vocab, PREFIX_PROMPT)
