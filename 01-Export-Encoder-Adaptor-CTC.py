@@ -1,3 +1,22 @@
+import os
+import sys
+import warnings
+import logging
+
+# =========================================================================
+# Environment Setup (Must be before importing torch)
+# =========================================================================
+
+# Force CPU usage to avoid CUDA version mismatch warnings (RTX 5050 vs Old PyTorch)
+# and to ensure the ONNX graph is device-agnostic.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Suppress specific warnings to clean up output
+warnings.filterwarnings("ignore", category=DeprecationWarning) # Ignore Legacy Exporter warning
+warnings.filterwarnings("ignore", category=UserWarning, message=".*Constant folding.*") # Ignore slice warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*dynamic_axes.*") 
+logging.getLogger("onnxruntime").setLevel(logging.ERROR) # Quiet ONNX Runtime
+logging.getLogger("root").setLevel(logging.ERROR)        # Quiet Quantizer
 
 import gc
 import time
@@ -6,9 +25,7 @@ import torchaudio
 import numpy as np
 import onnxruntime
 from onnxruntime.quantization import quantize_dynamic, QuantType
-import os
 import base64
-import sys
 from pathlib import Path
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,7 +64,6 @@ PRE_EMPHASIZE = 0.97
 LFR_M = 7
 LFR_N = 6 
 DOWNSAMPLE_RATE = 1 # Matched with model.pt (k=1)
-MAX_INPUT_AUDIO_LENGTH = SAMPLE_RATE * 30 # 30s
 OPSET = 18
 
 # =========================================================================
@@ -189,7 +205,7 @@ class CorrectTransformerAdaptor(nn.Module):
         if ilens is not None:
             olens = (ilens - 1) // self.k + 1
             pass 
-
+        
         if self.blocks is not None:
             for block in self.blocks:
                 x, masks = block(x, masks)
@@ -262,11 +278,9 @@ class EncoderExportWrapper(torch.nn.Module):
         x = torch.cat(lfr_list, dim=-1)
         
         # 1. Encoder Execution (6x)
-        # Fix: SenseVoiceEncoderSmall returns only xs_pad
         enc_output = self.hybrid_model.audio_encoder(x)
         
         # 2. Adaptor Execution (1x)
-        # Returns: adaptor_output (Deep Semantics)
         adaptor_output, _ = self.hybrid_model.audio_adaptor(enc_output, None)
         
         # 3. Official Slicing (Simulated 8x Downsampling)
@@ -282,10 +296,13 @@ class EncoderExportWrapper(torch.nn.Module):
 class CTCHeadExportWrapper(torch.nn.Module):
     def __init__(self, hybrid_model):
         super().__init__()
-        self.hybrid_model = hybrid_model
+        # Hold only used submodules to avoid redundant weight export
+        self.ctc_decoder = hybrid_model.ctc_decoder
+        self.ctc_proj = hybrid_model.ctc_proj
+        
     def forward(self, enc_output):
-        h, _ = self.hybrid_model.ctc_decoder(enc_output, None)
-        logits = self.hybrid_model.ctc_proj.ctc_lo(h)
+        h, _ = self.ctc_decoder(enc_output, None)
+        logits = self.ctc_proj.ctc_lo(h)
         return logits
 
 # =========================================================================
@@ -340,8 +357,9 @@ def main():
             for i, t in enumerate(tokens): f.write(f"{t} {i}\n")
     else:
         print("Warning: tiktoken file not found, vocab generation skipped.")
-        tokens = ["dummy"] * 60515 # Fallback size
+        tokens = ["dummy"] * 60515 
 
+    # Load model to CPU explicitly
     hybrid = HybridSenseVoice(vocab_size=len(tokens))
     hybrid.load_weights(weight_path)
     hybrid.eval()
@@ -365,19 +383,30 @@ def main():
                 'adaptor_output': {1: 'adaptor_len'}
             },
             opset_version=OPSET,
-            dynamo=False
+            dynamo=False  # Explicitly use legacy exporter to keep single file
         )
         print(f"Saved to: {onnx_encoder_fp32}")
 
         print(f"\n[2/4] Exporting CTC Head...")
+        # Clean up potential leftover .data files if they exist from previous runs
+        data_file = onnx_ctc_fp32 + ".data"
+        if os.path.exists(data_file):
+            try:
+                os.remove(data_file)
+                print(f"Removed stale data file: {data_file}")
+            except OSError:
+                pass
+
         ctc_wrapper = CTCHeadExportWrapper(hybrid)
         # Dummy input must match encoder output dim (512)
         dummy_enc = torch.randn(1, 100, 512)
+        
         torch.onnx.export(
             ctc_wrapper, (dummy_enc,), onnx_ctc_fp32,
             input_names=['enc_output'], output_names=['logits'],
             dynamic_axes={'enc_output': {1: 'enc_len'}, 'logits': {1: 'enc_len'}},
-            opset_version=OPSET
+            opset_version=OPSET,
+            dynamo=False # FIXED: Forces single file output (avoiding .data split)
         )
         print(f"Saved to: {onnx_ctc_fp32}")
 
