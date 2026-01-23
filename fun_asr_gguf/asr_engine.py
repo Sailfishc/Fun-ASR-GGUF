@@ -23,6 +23,9 @@ from .nano_ctc import load_ctc_tokens, decode_ctc, align_timestamps
 from .nano_audio import load_audio
 from .nano_onnx import load_onnx_models, encode_audio
 from .hotword.manager import get_hotword_manager
+from .utils import vprint
+from .text_merge import merge_transcription_results
+from .prompt_utils import PromptBuilder
 from .nano_dataclass import (
     RecognitionResult,
     RecognitionStream,
@@ -41,12 +44,7 @@ from .nano_dataclass import (
 # os.environ["GGML_VK_DISABLE_F16"] = "1"       # 禁止 VulkanFP16 计算（Intel集显fp16有溢出问题）
 
 
-# ==================== 辅助函数 ====================
-
-def vprint(message: str, verbose: bool = True):
-    """条件打印：仅在 verbose=True 时打印"""
-    if verbose:
-        print(message)
+# ==================== 辅助函数已移至 utils.py ====================
 
 
 class FunASREngine:
@@ -175,6 +173,9 @@ class FunASREngine:
             # 5. 加载 CTC 词表
             vprint("[5/6] 加载 CTC 词表...", verbose)
             self.ctc_id2token = load_ctc_tokens(self.tokens_path)
+            
+            # 初始化 Prompt 构建器
+            self.prompt_builder = PromptBuilder(self.vocab, self.embedding_table)
 
             # 6. 初始化热词管理器
             vprint("[6/6] 初始化热词管理器...", verbose)
@@ -246,46 +247,15 @@ class FunASREngine:
         context: Optional[str] = None,
         verbose: bool = False
     ) -> Tuple[np.ndarray, np.ndarray, int, int]:
-        """准备 Prompt Embeddings
-
-        Args:
-            hotwords: 热词列表
-            language: 目标语言（如 "中文", "英文", "日文"）
-            context: 上下文信息
-            verbose: 是否打印 Prompt 信息
-        """
-        # 构建 Prompt
-        prefix_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-
-        if hotwords or context:
-            if context:
-                prefix_prompt += f"请结合上下文信息，更加准确地完成语音转写任务。\n\n\n"
-                prefix_prompt += f"**上下文信息：**{context}\n\n\n"
-
-            if hotwords:
-                hotwords_str = ", ".join(hotwords)
-                prefix_prompt += f"热词列表：[{hotwords_str}]\n"
-
-        if not language:  # 空字符串或 None 都不指定语言
-            prefix_prompt += "语音转写："
-        else:
-            prefix_prompt += f"语音转写成{language}："
-
-        suffix_prompt = "<|im_end|>\n<|im_start|>assistant\n"
-
-        # 转换为 embeddings
-        prefix_tokens = nano_llama.text_to_tokens(self.vocab, prefix_prompt)
-        suffix_tokens = nano_llama.text_to_tokens(self.vocab, suffix_prompt)
-
-        prefix_embd = self.embedding_table[prefix_tokens].astype(np.float32)
-        suffix_embd = self.embedding_table[suffix_tokens].astype(np.float32)
-
+        """准备 Prompt Embeddings (代理跳转到 PromptBuilder)"""
+        p_embd, s_embd, n_p, n_s, p_text = self.prompt_builder.build_prompt(hotwords, language, context)
+        
         if verbose:
             vprint("-" * 15 + " Prefix Prompt " + "-" * 15, verbose)
-            vprint(prefix_prompt, verbose)
+            vprint(p_text, verbose)
             vprint("-" * 40, verbose)
-
-        return prefix_embd, suffix_embd, len(prefix_tokens), len(suffix_tokens)
+            
+        return p_embd, s_embd, n_p, n_s
 
     def _run_llm_decode(
         self,
@@ -384,7 +354,9 @@ class FunASREngine:
         audio_path: str,
         language: Optional[str] = None,
         context: Optional[str] = None,
-        verbose: bool = True
+        verbose: bool = True,
+        segment_size: float = 60.0,
+        overlap: float = 5.0
     ) -> TranscriptionResult:
         """
         转录音频文件
@@ -394,6 +366,8 @@ class FunASREngine:
             language: 目标语言（如 "中文", "英文", "日文"）
             context: 上下文信息
             verbose: 是否打印详细信息
+            segment_size: 长音频分段大小（秒）
+            overlap: 分段重叠大小（秒）
 
         Returns:
             TranscriptionResult 对象，包含识别结果和计时信息
@@ -418,55 +392,105 @@ class FunASREngine:
             audio_duration = audio_len / self.sample_rate
             vprint(f"    音频长度: {audio_duration:.2f}s", verbose)
 
-            # 2. 创建流并解码（复用 decode_stream）
-            stream = self.create_stream()
-            stream.accept_waveform(self.sample_rate, audio)
+            segment_size_s = segment_size
+            overlap_s = overlap
+            
+            if audio_duration <= segment_size_s + 2.0: # 留一点余量
+                # 短音频直接处理
+                stream = self.create_stream()
+                stream.accept_waveform(self.sample_rate, audio)
+                decode_result = self.decode_stream(stream, language=language, context=context, verbose=verbose)
+                
+                # 复制计时和结果
+                for field in ['encode', 'ctc', 'prepare', 'inject', 'llm_generate', 'align']:
+                    setattr(timings, field, getattr(decode_result.timings, field))
+                
+                result.text = decode_result.text
+                result.segments = decode_result.aligned or []
+                result.hotwords = decode_result.hotwords
+                if decode_result.ctc_results:
+                    result.ctc_text = ''.join([r.text for r in decode_result.ctc_results])
+                
+                # 统计信息
+                if verbose:
+                    stats = Statistics(
+                        audio_duration=audio_duration,
+                        n_input_tokens=decode_result.audio_embd.shape[0] + decode_result.n_prefix + decode_result.n_suffix,
+                        n_prefix_tokens=decode_result.n_prefix,
+                        n_audio_tokens=decode_result.audio_embd.shape[0],
+                        n_suffix_tokens=decode_result.n_suffix,
+                        n_generated_tokens=decode_result.n_gen,
+                    )
+                    stats.tps_in = stats.n_input_tokens / timings.inject if timings.inject > 0 else 0
+                    stats.tps_out = decode_result.n_gen / timings.llm_generate if timings.llm_generate > 0 else 0
+                    vprint(f"\n[统计]\n{stats}", verbose)
+            else:
+                # 长音频分段处理
+                vprint(f"    检测到长音频，开启分段识别模式...", verbose)
+                segments = []
+                segment_step = segment_size_s - overlap_s
+                
+                start_s = 0.0
+                while start_s < audio_duration:
+                    end_s = min(start_s + segment_size_s, audio_duration)
+                    segments.append((start_s, end_s))
+                    if end_s >= audio_duration:
+                        break
+                    start_s += segment_step
+                
+                segment_results = []
+                for idx, (s_s, e_s) in enumerate(segments):
+                    vprint(f"\n--- 处理分段 {idx+1}/{len(segments)} [{s_s:.1f}s - {e_s:.1f}s] ---", verbose)
+                    start_sample = int(s_s * self.sample_rate)
+                    end_sample = int(e_s * self.sample_rate)
+                    chunk_audio = audio[start_sample:end_sample]
+                    
+                    stream = self.create_stream()
+                    stream.accept_waveform(self.sample_rate, chunk_audio)
+                    # 长音频分片建议不打印中途的 prompt 以保持整洁，或者仅在第一个片段打印
+                    d_res = self.decode_stream(stream, language=language, context=context, verbose=verbose if idx==0 else False)
+                    
+                    segment_results.append({
+                        'text': d_res.text,
+                        'segments': d_res.aligned,
+                        'duration': e_s - s_s,
+                        'hotwords': d_res.hotwords,
+                        'ctc_text': "".join([r.text for r in d_res.ctc_results]) if d_res.ctc_results else ""
+                    })
+                    
+                    # 累加计时（这里简单求和作为总参考）
+                    timings.encode += d_res.timings.encode
+                    timings.ctc += d_res.timings.ctc
+                    timings.inject += d_res.timings.inject
+                    timings.llm_generate += d_res.timings.llm_generate
+                    timings.align += d_res.timings.align
+                
+                # 合并结果
+                segment_offsets = [c[0] for c in segments]
+                full_text, full_segments = merge_transcription_results(segment_results, segment_offsets, overlap_s)
+                
+                result.text = full_text
+                result.segments = full_segments
+                # 合并各分段的热词和 CTC 文本
+                all_hotwords = set()
+                all_ctc_texts = []
+                for r in segment_results:
+                    all_hotwords.update(r['hotwords'])
+                    if 'ctc_text' in r:
+                        all_ctc_texts.append(r['ctc_text'])
+                result.hotwords = list(all_hotwords)
+                result.ctc_text = "".join(all_ctc_texts)
 
-            # 调用 decode_stream 并获取结果
-            decode_result = self.decode_stream(stream, language=language, context=context, verbose=verbose)
-
-            # 复制计时信息
-            timings.encode = decode_result.timings.encode
-            timings.ctc = decode_result.timings.ctc
-            timings.prepare = decode_result.timings.prepare
-            timings.inject = decode_result.timings.inject
-            timings.llm_generate = decode_result.timings.llm_generate
-            timings.align = decode_result.timings.align
-
-            # 填充结果
-            result.text = decode_result.text
-            result.segments = decode_result.aligned or []
-            result.hotwords = decode_result.hotwords
-
-            if decode_result.ctc_results:
-                ctc_text = ''.join([r.text for r in decode_result.ctc_results])
-                result.ctc_text = ctc_text
-
-            # 统计信息
+            # 最终耗时统计
             timings.total = time.perf_counter() - t_start
 
             if verbose:
-                # 使用 Statistics dataclass
-                stats = Statistics(
-                    audio_duration=audio_duration,
-                    n_input_tokens=decode_result.audio_embd.shape[0] + decode_result.n_prefix + decode_result.n_suffix,
-                    n_prefix_tokens=decode_result.n_prefix,
-                    n_audio_tokens=decode_result.audio_embd.shape[0],
-                    n_suffix_tokens=decode_result.n_suffix,
-                    n_generated_tokens=decode_result.n_gen,
-                )
-                stats.tps_in = (decode_result.audio_embd.shape[0] + decode_result.n_prefix + decode_result.n_suffix) / timings.inject if timings.inject > 0 else 0
-                stats.tps_out = decode_result.n_gen / timings.llm_generate if timings.llm_generate > 0 else 0
-
-                vprint(f"\n[统计]\n{stats}", verbose)
-
-                # 格式化耗时显示（与 asr_e2e.py 一致）
                 vprint(f"\n[转录耗时]", verbose)
                 vprint(f"  - 音频编码： {timings.encode*1000:5.0f}ms", verbose)
                 vprint(f"  - CTC解码：  {timings.ctc*1000:5.0f}ms", verbose)
                 vprint(f"  - LLM读取：  {timings.inject*1000:5.0f}ms", verbose)
                 vprint(f"  - LLM生成：  {timings.llm_generate*1000:5.0f}ms", verbose)
-                if decode_result.aligned:
+                if result.segments:
                     vprint(f"  - 时间戳对齐:{timings.align*1000:5.0f}ms", verbose)
                 vprint(f"  - 总耗时：   {timings.total:5.2f}s", verbose)
                 vprint("", verbose)

@@ -304,7 +304,13 @@ A: Fun-ASR-Nano-2512 支持中文、英文、日文。Fun-ASR-MLT-Nano-2512 还�
 A:
 1. 使用 `context` 参数提供上下文信息
 2. 配置 `hot.txt` 添加领域热词
-3. 指定正确的 `language` 参数
+
+### Q: 如何提高识别准确率？
+
+A:
+1. 使用 `context` 参数提供上下文信息
+2. 配置 `hot.txt` 添加领域热词
+
 
 ---
 
