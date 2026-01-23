@@ -9,6 +9,8 @@ def load_onnx_models(encoder_path, ctc_path):
     
     t_start = time.perf_counter()
     session_opts = onnxruntime.SessionOptions()
+    session_opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    session_opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
     session_opts.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     
     encoder_sess = onnxruntime.InferenceSession(
