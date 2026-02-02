@@ -771,6 +771,7 @@ def token_to_bytes(vocab, token_id):
     n = llama_token_to_piece(vocab, token_id, buf, ctypes.sizeof(buf), 0, True)
     return buf.raw[:n] if n > 0 else b""
 
+
 def get_token_embeddings_gguf(model_path):
     model_name = os.path.splitext(os.path.basename(model_path))[0]
     cache_path = os.path.join(os.path.dirname(model_path), f"{model_name}.embd.npy")
@@ -780,22 +781,40 @@ def get_token_embeddings_gguf(model_path):
     
     reader = gguf.GGUFReader(model_path, mode='r')
     
-    # 获取 Embedding 维度 (Hidden Size)
-    n_embd = 1024 # 默认值
-    if "llama.embedding_length" in reader.metadata:
-        n_embd = int(reader.metadata["llama.embedding_length"][0])
-    
+    # 查找 Embedding 张量
+    target_tensor = None
     for t in reader.tensors:
         if t.name == "token_embd.weight":
-            if t.tensor_type == 8: # Q8_0
-                data_u8 = np.frombuffer(t.data, dtype=np.uint8)
-                n_blocks = data_u8.size // 34
-                blocks = data_u8.reshape(n_blocks, 34)
-                deltas = blocks[:, :2].view(np.float16).flatten()
-                quants = blocks[:, 2:].view(np.int8)
-                data = (deltas[:, np.newaxis] * quants).flatten().astype(np.float32).reshape(-1, n_embd)
-            else:
-                data = t.data.astype(np.float32) if t.data.dtype == np.float16 else t.data
-            np.save(cache_path, data)
-            return data
-    return None
+            target_tensor = t
+            break
+            
+    if target_tensor is None:
+        return None
+        
+    # 从元数据确定维度 (由于 Key 含有架构前缀，我们遍历查找)
+    n_embd = target_tensor.shape[0] # 稳健做法：优先使用张量形状
+    for key, field in reader.fields.items():
+        if "embedding_length" in key:
+            n_embd = int(field.parts[-1][0])
+            break
+    
+    # 获取数据
+    if target_tensor.tensor_type == 8: # Q8_0
+        data_u8 = np.frombuffer(target_tensor.data, dtype=np.uint8)
+        n_blocks = data_u8.size // 34
+        blocks = data_u8.reshape(n_blocks, 34)
+        deltas = blocks[:, :2].view(np.float16).flatten()
+        quants = blocks[:, 2:].view(np.int8)
+        data = (deltas[:, np.newaxis] * quants).flatten().astype(np.float32).reshape(-1, n_embd)
+    else:
+        # F16 或其他原生类型
+        data = target_tensor.data
+        if isinstance(data, np.memmap) or isinstance(data, np.ndarray):
+            if data.dtype == np.float16:
+                data = data.astype(np.float32)
+        else:
+            # 兜底：如果是原始 buffer
+            data = np.frombuffer(target_tensor.data, dtype=np.float16).astype(np.float32).reshape(-1, n_embd)
+            
+    np.save(cache_path, data)
+    return data
