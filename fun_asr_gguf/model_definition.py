@@ -287,11 +287,12 @@ class MultiHeadedAttention(nn.Module):
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
 
-    def forward_qkv(self, x):
-        q = self.linear_q(x).unflatten(-1, (self.h, self.d_k))
-        k = self.linear_k(x).unflatten(-1, (self.h, self.d_k))
-        v = self.linear_v(x).unflatten(-1, (self.h, self.d_k))
-        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), v
+    def forward_qkv(self, query, key, value):
+        q = self.linear_q(query).unflatten(-1, (self.h, self.d_k))
+        k = self.linear_k(key).unflatten(-1, (self.h, self.d_k))
+        v = self.linear_v(value).unflatten(-1, (self.h, self.d_k))
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
     def forward_attention(self, value, scores, mask):
         if mask is not None:
             mask = mask.unsqueeze(1).eq(0)
@@ -304,27 +305,25 @@ class MultiHeadedAttention(nn.Module):
         x = x.transpose(1, 2).flatten(2)
         return self.linear_out(x)
 
-    def forward(self, x, mask):
-        q_h, k_h, v_h, v = self.forward_qkv(x)
-        q_h = q_h * (self.d_k ** -0.5)
-        scores = torch.matmul(q_h, k_h.transpose(-2, -1))
-        att_outs = self.forward_attention(v_h, scores, mask)
-        return att_outs
+    def forward(self, query, key, value, mask):
+        q, k, v = self.forward_qkv(query, key, value)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * (self.d_k ** -0.5)
+        return self.forward_attention(v, scores, mask)
 
 class EncoderLayer(nn.Module):
     def __init__(self, size, self_attn, feed_forward, dropout_rate, normalize_before=True):
         super().__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.norm1 = LayerNorm(size, eps=1e-12)
-        self.norm2 = LayerNorm(size, eps=1e-12)
+        self.norm1 = nn.LayerNorm(size, eps=1e-12)
+        self.norm2 = nn.LayerNorm(size, eps=1e-12)
         self.dropout = nn.Dropout(dropout_rate)
         self.normalize_before = normalize_before
 
     def forward(self, x, mask=None):
         residual = x
         if self.normalize_before: x = self.norm1(x)
-        x = residual + self.dropout(self.self_attn(x, mask))
+        x = residual + self.dropout(self.self_attn(x, x, x, mask))
         if not self.normalize_before: x = self.norm1(x)
 
         residual = x
@@ -350,12 +349,11 @@ class CorrectTransformerAdaptor(nn.Module):
         ]) if n_layer > 0 else None
 
     def forward(self, x, ilens=None):
-        if self.k > 1:
-            batch_size, seq_len, dim = x.size()
-            chunk_num = (seq_len - 1) // self.k + 1
-            pad_num = chunk_num * self.k - seq_len
-            x = F.pad(x, (0, 0, 0, pad_num), value=0.0)
-            x = x.unflatten(1, (chunk_num, self.k)).flatten(2)
+        batch_size, seq_len, dim = x.size()
+        chunk_num = (seq_len - 1) // self.k + 1
+        pad_num = chunk_num * self.k - seq_len
+        x = F.pad(x, (0, 0, 0, pad_num), value=0.0)
+        x = x.unflatten(1, (chunk_num, self.k)).flatten(2)
         
         x = self.linear2(self.relu(self.linear1(x)))
         masks = None
