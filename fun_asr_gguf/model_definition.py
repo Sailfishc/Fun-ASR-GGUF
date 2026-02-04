@@ -41,15 +41,7 @@ class PositionwiseFeedForward(nn.Module):
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, input):
-        # Explicit float computation for stability with FP16/DML
-        output = F.layer_norm(
-            input.float(), 
-            self.normalized_shape, 
-            self.weight.float() if self.weight is not None else None, 
-            self.bias.float() if self.bias is not None else None, 
-            self.eps
-        )
-        return output.type_as(input)
+        return F.layer_norm(input, self.normalized_shape, self.weight, self.bias, self.eps)
 
 # ============================================================================
 # SANM Components
@@ -253,9 +245,9 @@ class STFT_Process(nn.Module):
     def __init__(self, n_fft=400, win_length=400, hop_len=160):
         super().__init__()
         self.n_fft, self.hop_len, self.half_n_fft = n_fft, hop_len, n_fft // 2
-        window = torch.hamming_window(win_length, periodic=True).float()
+        window = torch.hamming_window(win_length, periodic=True)
         if win_length < n_fft: window = F.pad(window, ((n_fft - win_length) // 2, n_fft - win_length - (n_fft - win_length) // 2))
-        t, f = torch.arange(n_fft).float().unsqueeze(0), torch.arange(self.half_n_fft + 1).float().unsqueeze(1)
+        t, f = torch.arange(n_fft).unsqueeze(0), torch.arange(self.half_n_fft + 1).unsqueeze(1)
         omega = 2 * torch.pi * f * t / n_fft
         self.register_buffer('cos_kernel', (torch.cos(omega) * window.unsqueeze(0)).unsqueeze(1))
         self.register_buffer('sin_kernel', (-torch.sin(omega) * window.unsqueeze(0)).unsqueeze(1))
@@ -279,11 +271,11 @@ class EncoderExportWrapperPaddable(nn.Module):
         valid_samples = ilens[0]
         batch, _, samples = audio.shape
         audio_indices = torch.ones_like(audio, dtype=torch.long).cumsum(-1) - 1
-        audio_mask = (audio_indices < valid_samples).float()
+        audio_mask = (audio_indices < valid_samples)
 
         # 1. Normalization
         sum_val = (audio * audio_mask).sum()
-        mean_val = sum_val / valid_samples.float()
+        mean_val = sum_val / valid_samples
         audio = (audio - mean_val) * audio_mask
         if self.pre_emphasis_val > 0:
             audio = torch.cat([audio[..., :1], audio[..., 1:] - self.pre_emphasis * audio[..., :-1]], dim=-1)
@@ -316,7 +308,7 @@ class EncoderExportWrapperPaddable(nn.Module):
         x = torch.cat(lfr_list, dim=-1)
         
         # 4. Masking & Model
-        m = (torch.arange(T_lfr_phys, device=x.device).unsqueeze(0) < T_lfr_valid).float()
+        m = (torch.arange(T_lfr_phys, device=x.device).unsqueeze(0) < T_lfr_valid)
         x = x * m.unsqueeze(-1)
         
         enc = self.hybrid_model.audio_encoder(x, m)
