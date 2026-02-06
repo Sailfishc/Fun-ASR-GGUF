@@ -96,6 +96,9 @@ class ModelManager:
             
         except Exception as e:
             vprint(f"✗ 初始化失败: {e}", verbose)
+            import traceback
+            print(f"✗ 初始化失败: {e}", file=__import__('sys').stderr, flush=True)
+            traceback.print_exc(file=__import__('sys').stderr)
             return False
 
     def cleanup(self):
