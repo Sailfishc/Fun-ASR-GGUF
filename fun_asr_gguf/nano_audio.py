@@ -10,8 +10,8 @@ def load_audio(audio_path, sample_rate=16000, use_normalizer=True, start_second=
         "frame_rate": sample_rate, 
         "channels": 1
     }
-    if start_second is not None: load_kwargs['start_second'] = start_second
-    if duration is not None: load_kwargs['duration'] = duration
+    if start_second: load_kwargs['start_second'] = start_second
+    if duration: load_kwargs['duration'] = duration
 
     audio_segment = AudioSegment.from_file(audio_path, **load_kwargs)
 

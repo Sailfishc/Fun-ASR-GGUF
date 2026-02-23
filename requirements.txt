@@ -2,6 +2,7 @@
 
 onnx 
 onnxruntime 
+scipy
 numpy 
 pydub 
 gguf

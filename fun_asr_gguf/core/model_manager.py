@@ -89,7 +89,8 @@ class ModelManager:
             self.hotword_manager.load()
             self.hotword_manager.start_file_watcher()
             self.corrector = self.hotword_manager.get_corrector()
-            
+            self.corrector.correct("热个身") # 热身
+
             self._initialized = True
             vprint(f"✓ 模型加载完成 (耗时: {time.perf_counter() - t_start:.2f}s)", verbose)
             return True

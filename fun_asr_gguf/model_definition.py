@@ -271,7 +271,7 @@ class EncoderExportWrapperPaddable(nn.Module):
         valid_samples = ilens[0]
         batch, _, samples = audio.shape
         audio_indices = torch.ones_like(audio, dtype=torch.long).cumsum(-1) - 1
-        audio_mask = (audio_indices < valid_samples)
+        audio_mask = (audio_indices < valid_samples).type(audio.dtype)
 
         # 1. Normalization
         sum_val = (audio * audio_mask).sum()
@@ -307,8 +307,7 @@ class EncoderExportWrapperPaddable(nn.Module):
             lfr_list.append(feat[:, :T_lfr_phys, :])
         x = torch.cat(lfr_list, dim=-1)
         
-        # 4. Masking & Model
-        m = (torch.arange(T_lfr_phys, device=x.device).unsqueeze(0) < T_lfr_valid)
+        m = (torch.arange(T_lfr_phys, device=x.device).unsqueeze(0) < T_lfr_valid).type(audio.dtype)
         x = x * m.unsqueeze(-1)
         
         enc = self.hybrid_model.audio_encoder(x, m)
@@ -336,3 +335,19 @@ class CTCHeadExportWrapper(nn.Module):
     def forward(self, enc_output):
         h, _ = self.ctc_decoder(enc_output, None)
         return torch.argmax(self.ctc_proj.ctc_lo(h), dim=-1).to(torch.int32)
+
+class CleanEncoderExportWrapper(nn.Module):
+    """
+    Experimental Clean Encoder Wrapper (Input: LFR Features, Mask)
+    Stripped of STFT, Mel, and LFR logic.
+    """
+    def __init__(self, hybrid_model):
+        super().__init__()
+        self.hybrid_model = hybrid_model
+
+    def forward(self, lfr_feat, mask):
+        # lfr_feat: (Batch, T, 560)
+        # mask: (Batch, T) 
+        enc = self.hybrid_model.audio_encoder(lfr_feat, mask)
+        adapt, _ = self.hybrid_model.audio_adaptor(enc, mask)
+        return enc, adapt
